@@ -1,1 +1,7 @@
-/venv
+venv/
+*.db
+*.mp4
+pdbbam944MQcIvR9iv0Br
+__pycache__/
+*.pyc
+.claude/

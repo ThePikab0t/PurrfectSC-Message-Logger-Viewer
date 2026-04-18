@@ -677,7 +677,7 @@ async function loadMessages(username) {
   const msgs = await fetch('/api/conversation/'+encodeURIComponent(username)).then(r=>r.json());
   hideLoading();
   const pane = document.getElementById('contentPane');
-  if (!msgs.length) { pane.innerHTML = '<div style="color:#333;padding:20px">No messages</div>'; return; }
+  if (!msgs.length) { pane.style.cssText=''; pane.className='messages'; pane.innerHTML = '<div style="color:#333;padding:20px">No messages</div>'; return; }
 
   let lastConvId = null;
   let html = '';
@@ -734,6 +734,8 @@ async function loadMessages(username) {
     }
   });
 
+  pane.style.cssText = '';
+  pane.className = 'messages';
   pane.innerHTML = html;
   pane.scrollTop = pane.scrollHeight;
 }
@@ -786,7 +788,11 @@ function stepMatch(dir) {
 function scrollToMatch() {
   _matchEls.forEach((el, i) => el.classList.toggle('active-match', i === _matchIdx));
   const active = _matchEls[_matchIdx];
-  if (active) active.scrollIntoView({behavior:'smooth', block:'center'});
+  if (!active) return;
+  const pane = document.getElementById('contentPane');
+  const paneTop = pane.getBoundingClientRect().top;
+  const elTop   = active.getBoundingClientRect().top;
+  pane.scrollTop += elTop - paneTop - (pane.clientHeight / 2);
 }
 
 function filterStories(q) {
@@ -824,8 +830,9 @@ async function loadStoriesById(userId) {
   const stories = await fetch('/api/stories/'+encodeURIComponent(userId)).then(r=>r.json());
   hideLoading();
   const pane = document.getElementById('contentPane');
-  if (!stories.length) { pane.className='messages'; pane.innerHTML = '<div style="color:#444;padding:20px">No stories</div>'; return; }
+  if (!stories.length) { pane.style.cssText=''; pane.className='messages'; pane.innerHTML = '<div style="color:#444;padding:20px">No stories</div>'; return; }
 
+  pane.style.cssText = '';
   pane.className = 'stories-grid';
   pane.innerHTML = stories.map(s => {
     const mediaEl = s.is_video
