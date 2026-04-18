@@ -16,6 +16,21 @@ def get_db():
     return conn
 
 
+def ensure_indexes():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_user_id   ON messages(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_username  ON messages(username)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_msg_conv_id   ON messages(conversation_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_stories_uid   ON stories(user_id)")
+    conn.commit()
+    conn.close()
+    print("Indexes ready.")
+
+
+ensure_indexes()
+
+
 _SYSTEM_STRINGS = {
     "CHAT", "SNAP", "EXTERNAL_MEDIA", "NOTE", "STICKER", "SHARE",
     "UNKNOWN", "NONE", "NORMAL", "STATUS", "OPEN", "CLOSED",
@@ -120,19 +135,22 @@ def api_stats():
 @app.route("/api/users")
 def api_users():
     q = request.args.get("q", "").strip().lower()
+    sort = request.args.get("sort", "recent")
+    order = "lower(username) ASC" if sort == "az" else "last_ts DESC"
+    limit = 100 if q else 200
     conn = get_db()
     cur = conn.cursor()
     if q:
         cur.execute(
-            """SELECT username, COUNT(*) as msg_count, MAX(send_timestamp) as last_ts
+            f"""SELECT username, COUNT(*) as msg_count, MAX(send_timestamp) as last_ts
                FROM messages WHERE lower(username) LIKE ?
-               GROUP BY username ORDER BY last_ts DESC LIMIT 100""",
+               GROUP BY username ORDER BY {order} LIMIT {limit}""",
             (f"%{q}%",),
         )
     else:
         cur.execute(
-            """SELECT username, COUNT(*) as msg_count, MAX(send_timestamp) as last_ts
-               FROM messages GROUP BY username ORDER BY last_ts DESC LIMIT 200"""
+            f"""SELECT username, COUNT(*) as msg_count, MAX(send_timestamp) as last_ts
+               FROM messages GROUP BY username ORDER BY {order} LIMIT {limit}"""
         )
     rows = cur.fetchall()
     conn.close()
@@ -151,9 +169,10 @@ def api_users():
 @app.route("/api/story-users")
 def api_story_users():
     q = request.args.get("q", "").strip().lower()
+    sort = request.args.get("sort", "recent")
+    order = "lower(COALESCE(username, s.user_id)) ASC" if sort == "az" else "last_ts DESC"
     conn = get_db()
     cur = conn.cursor()
-    # Use subquery to avoid COUNT(*) inflation from the LEFT JOIN
     base = """
         SELECT s.user_id,
                (SELECT MAX(username) FROM messages WHERE user_id = s.user_id) as username,
@@ -164,11 +183,11 @@ def api_story_users():
     """
     if q:
         cur.execute(
-            base + " HAVING lower(COALESCE(username, s.user_id)) LIKE ? ORDER BY last_ts DESC LIMIT 100",
+            base + f" HAVING lower(COALESCE(username, s.user_id)) LIKE ? ORDER BY {order} LIMIT 100",
             (f"%{q}%",),
         )
     else:
-        cur.execute(base + " ORDER BY last_ts DESC LIMIT 200")
+        cur.execute(base + f" ORDER BY {order} LIMIT 200")
     rows = cur.fetchall()
     conn.close()
     return jsonify(
@@ -183,6 +202,20 @@ def api_story_users():
             for r in rows
         ]
     )
+
+
+@app.route("/api/user-id/<username>")
+def api_user_id(username):
+    """Fast lookup: username → user_id for stories."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT DISTINCT user_id FROM messages WHERE username = ? LIMIT 1",
+        (username,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return jsonify({"user_id": row["user_id"] if row else None})
 
 
 @app.route("/api/stories/<user_id>")
@@ -324,9 +357,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .sidebar-tabs{display:flex;border-bottom:1px solid #222}
   .sidebar-tab{flex:1;padding:9px 6px;text-align:center;font-size:0.78rem;cursor:pointer;color:#666;border-bottom:2px solid transparent;transition:all .15s}
   .sidebar-tab.active{color:#a78bfa;border-bottom-color:#a78bfa;background:#161626}
-  .search-box{padding:8px 10px;border-bottom:1px solid #1e1e1e}
-  .search-box input{width:100%;padding:7px 11px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;color:#e0e0e0;font-size:0.82rem;outline:none}
+  .search-box{padding:7px 10px;border-bottom:1px solid #1e1e1e;display:flex;gap:6px;align-items:center}
+  .search-box input{flex:1;padding:6px 10px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;color:#e0e0e0;font-size:0.82rem;outline:none;min-width:0}
   .search-box input:focus{border-color:#a78bfa}
+  .sort-btn{padding:5px 8px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:7px;color:#555;cursor:pointer;font-size:0.7rem;white-space:nowrap;flex-shrink:0}
+  .sort-btn.active-az{color:#a78bfa;border-color:#a78bfa}
   .list-pane{flex:1;overflow-y:auto}
   .list-item{padding:9px 13px;cursor:pointer;border-bottom:1px solid #181818;transition:background .12s}
   .list-item:hover{background:#1c1c2c}
@@ -345,28 +380,49 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tab-btn.active{background:#a78bfa;color:#fff;border-color:#a78bfa}
 
   /* Messages */
-  .messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:3px}
-  .msg{display:flex;gap:10px;align-items:flex-start;padding:3px 5px;border-radius:5px}
-  .msg:hover{background:#161616}
-  .msg-ts{font-size:0.66rem;color:#383838;white-space:nowrap;padding-top:3px;min-width:105px}
-  .msg-body{flex:1}
-  .type-pill{display:inline-block;font-size:0.62rem;padding:1px 5px;border-radius:4px;margin-right:4px;vertical-align:middle;font-weight:600}
+  .messages{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:6px}
+  .msg-row{display:flex;flex-direction:column;max-width:72%}
+  .msg-row.me{align-self:flex-end;align-items:flex-end}
+  .msg-row.them{align-self:flex-start;align-items:flex-start}
+  .msg-row.status-row{align-self:center;max-width:90%}
+  .msg-sender{font-size:0.65rem;color:#555;margin-bottom:2px;padding:0 4px}
+  .msg-row.me .msg-sender{color:#6d56a0}
+  .msg-bubble{padding:6px 10px;border-radius:12px;max-width:100%;word-break:break-word}
+  .msg-row.me .msg-bubble{background:#2a1f4a;border-bottom-right-radius:3px}
+  .msg-row.them .msg-bubble{background:#1e1e1e;border-bottom-left-radius:3px}
+  .msg-row.status-row .msg-bubble{background:transparent;padding:2px 8px}
+  .msg-text{font-size:0.84rem;color:#d0d0d0}
+  .msg-row.me .msg-text{color:#c4b5fd}
+  .msg-meta{display:flex;align-items:center;gap:4px;margin-top:3px;padding:0 2px}
+  .msg-ts{font-size:0.62rem;color:#383838}
+  .type-pill{display:inline-block;font-size:0.6rem;padding:1px 4px;border-radius:3px;font-weight:600;vertical-align:middle}
   .pill-CHAT{background:#0d2b1a;color:#4ade80}
   .pill-SNAP{background:#0d1f2e;color:#38bdf8}
   .pill-EXTERNAL_MEDIA{background:#1e1030;color:#c084fc}
   .pill-NOTE{background:#2a2310;color:#fbbf24}
   .pill-STICKER{background:#0d2222;color:#34d399}
   .pill-SHARE{background:#2a1010;color:#f87171}
-  .pill-STATUS{background:#1a1a1a;color:#555}
+  .pill-STATUS{background:transparent;color:#333}
   .pill-UNKNOWN{background:#1a1a1a;color:#333}
-  .msg-text{font-size:0.84rem;color:#d0d0d0;word-break:break-word}
-  .snap-key{font-size:0.65rem;color:#1e6a9e;font-family:monospace;background:#0d1520;padding:1px 5px;border-radius:3px;margin-right:3px;display:inline-block}
-  .badge{font-size:0.58rem;padding:1px 4px;border-radius:3px;margin-left:2px;vertical-align:middle}
+  .snap-key{font-size:0.63rem;color:#3b82f6;font-family:monospace;background:#0d1520;padding:1px 5px;border-radius:3px;margin-right:3px;display:inline-block}
+  .badge{font-size:0.57rem;padding:1px 4px;border-radius:3px;vertical-align:middle}
   .b-edited{background:#2a2308;color:#fbbf24}
   .b-deleted{background:#2a0d0d;color:#f87171}
   .b-saved{background:#0d1a2a;color:#60a5fa}
   .b-shot{background:#2a0d1a;color:#f472b6}
   .b-audio{background:#1a1a0d;color:#a3e635}
+  .conv-sep{text-align:center;font-size:0.65rem;color:#2a2a2a;padding:8px 0;border-top:1px solid #1a1a1a;margin-top:8px}
+  .spinner{width:36px;height:36px;border:3px solid #2a2a2a;border-top-color:#a78bfa;border-radius:50%;animation:spin .7s linear infinite}
+  .loading-pane{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#555;font-size:0.8rem}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .msg-search-bar{padding:6px 12px;background:#111;border-bottom:1px solid #1e1e1e;display:flex;align-items:center;gap:8px;flex-shrink:0}
+  .msg-search-bar input{flex:1;padding:5px 10px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:6px;color:#e0e0e0;font-size:0.8rem;outline:none}
+  .msg-search-bar input:focus{border-color:#a78bfa}
+  .msg-search-count{font-size:0.7rem;color:#444;white-space:nowrap}
+  .highlight{background:#4c3a00;border-radius:2px;color:#fcd34d}
+  .highlight.active-match{background:#7c5c00;outline:2px solid #fcd34d}
+  .nav-btn{padding:3px 8px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:5px;color:#888;cursor:pointer;font-size:0.75rem}
+  .nav-btn:hover{border-color:#a78bfa;color:#a78bfa}
 
   /* Stories grid */
   .stories-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;align-content:start}
@@ -395,7 +451,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="sidebar-tab active" id="tabChats" onclick="switchSidebar('chats')">Chats</div>
       <div class="sidebar-tab" id="tabStories" onclick="switchSidebar('stories')">Stories</div>
     </div>
-    <div class="search-box"><input type="text" id="search" placeholder="Search..." autocomplete="off"></div>
+    <div class="search-box">
+      <input type="text" id="search" placeholder="Search..." autocomplete="off">
+      <button class="sort-btn" id="sortBtn" onclick="toggleSort()" title="Toggle sort order">Recent</button>
+    </div>
     <div class="list-pane" id="listPane"></div>
   </div>
   <div class="chat-area" id="chatArea">
@@ -409,6 +468,15 @@ let activeUserId = null;
 let activeSidebarMode = 'chats'; // 'chats' | 'stories'
 let activeChatTab = 'messages'; // 'messages' | 'stories'
 let searchTimer = null;
+let sortMode = 'recent'; // 'recent' | 'az'
+
+function toggleSort() {
+  sortMode = sortMode === 'recent' ? 'az' : 'recent';
+  const btn = document.getElementById('sortBtn');
+  btn.textContent = sortMode === 'az' ? 'A–Z' : 'Recent';
+  btn.classList.toggle('active-az', sortMode === 'az');
+  loadList(document.getElementById('search').value);
+}
 
 // ── Stats ────────────────────────────────────────────────────────────────────
 async function loadStats() {
@@ -434,7 +502,8 @@ function loadList(q) {
 
 // ── Chat users list ──────────────────────────────────────────────────────────
 async function loadChatUsers(q='') {
-  const users = await fetch('/api/users?q='+encodeURIComponent(q)).then(r=>r.json());
+  document.getElementById('listPane').innerHTML = '<div style="padding:16px;color:#444;font-size:0.8rem">Loading…</div>';
+  const users = await fetch('/api/users?q='+encodeURIComponent(q)+'&sort='+sortMode).then(r=>r.json());
   const pane = document.getElementById('listPane');
   pane.innerHTML = '';
   if (!users.length) { pane.innerHTML = '<div style="padding:14px;color:#333;font-size:0.78rem">No users found</div>'; return; }
@@ -450,7 +519,8 @@ async function loadChatUsers(q='') {
 
 // ── Story users list ─────────────────────────────────────────────────────────
 async function loadStoryUsers(q='') {
-  const users = await fetch('/api/story-users?q='+encodeURIComponent(q)).then(r=>r.json());
+  document.getElementById('listPane').innerHTML = '<div style="padding:16px;color:#444;font-size:0.8rem">Loading…</div>';
+  const users = await fetch('/api/story-users?q='+encodeURIComponent(q)+'&sort='+sortMode).then(r=>r.json());
   const pane = document.getElementById('listPane');
   pane.innerHTML = '';
   if (!users.length) { pane.innerHTML = '<div style="padding:14px;color:#333;font-size:0.78rem">No story users found</div>'; return; }
@@ -478,8 +548,15 @@ async function openChatUser(username) {
         <button class="tab-btn" onclick="switchChatTab('stories',this)">Stories</button>
       </div>
     </div>
-    <div id="contentPane" class="messages"><div style="color:#333;padding:20px">Loading…</div></div>`;
-  loadMessages(username);
+    <div class="msg-search-bar" id="msgSearchBar">
+      <input type="text" id="msgSearch" placeholder="Search in conversation…" autocomplete="off" oninput="filterMessages(this.value)">
+      <button class="nav-btn" id="prevMatch" onclick="stepMatch(-1)" style="display:none">▲</button>
+      <button class="nav-btn" id="nextMatch" onclick="stepMatch(1)" style="display:none">▼</button>
+      <span class="msg-search-count" id="msgSearchCount"></span>
+    </div>
+    <div id="contentPane"></div>`;
+  showLoading('Loading messages\u2026');
+  setTimeout(() => loadMessages(username), 0);
 }
 
 // ── Open story user (from stories sidebar) ───────────────────────────────────
@@ -492,8 +569,9 @@ function openStoryUser(userId, displayName) {
       <span class="chat-username">${esc(displayName)}</span>
       <span class="chat-sub">stories</span>
     </div>
-    <div id="contentPane" class="stories-grid"><div style="color:#333;padding:20px">Loading…</div></div>`;
-  loadStoriesById(userId);
+    <div id="contentPane"></div>`;
+  showLoading('Loading stories\u2026');
+  setTimeout(() => loadStoriesById(userId), 0);
 }
 
 function highlightActive(username, userId) {
@@ -512,29 +590,46 @@ function switchChatTab(tab, btn) {
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   const pane = document.getElementById('contentPane');
-  pane.className = tab==='stories' ? 'stories-grid' : 'messages';
-  pane.innerHTML = '<div style="color:#333;padding:20px">Loading…</div>';
-  if (tab==='messages') loadMessages(activeUser);
-  else {
-    // Need to resolve username -> user_id for stories
-    fetch('/api/users?q='+encodeURIComponent(activeUser)).then(r=>r.json()).then(users => {
-      // Find exact match then use user_id via story-users
-      fetch('/api/story-users?q='+encodeURIComponent(activeUser)).then(r=>r.json()).then(list => {
-        const found = list.find(u => u.display === activeUser || u.has_username && u.display === activeUser);
-        if (found) loadStoriesById(found.user_id);
-        else { pane.innerHTML = '<div style="color:#444;padding:20px">No stories for this user</div>'; }
-      });
-    });
+  const bar = document.getElementById('msgSearchBar');
+  const searchEl = document.getElementById('msgSearch');
+  const countEl = document.getElementById('msgSearchCount');
+  if (bar) bar.style.display = '';
+  if (searchEl) {
+    searchEl.value = '';
+    _matchEls = []; _matchIdx = -1;
+    const prevBtn = document.getElementById('prevMatch');
+    const nextBtn = document.getElementById('nextMatch');
+    if (prevBtn) prevBtn.style.display = 'none';
+    if (nextBtn) nextBtn.style.display = 'none';
+    searchEl.placeholder = tab === 'messages' ? 'Search in conversation…' : 'Filter stories by date…';
+    searchEl.oninput = tab === 'messages'
+      ? () => filterMessages(searchEl.value)
+      : () => filterStories(searchEl.value);
   }
+  if (countEl) countEl.textContent = '';
+  showLoading(tab==='messages' ? 'Loading messages\u2026' : 'Loading stories\u2026', pane);
+  setTimeout(() => {
+    if (tab==='messages') {
+      loadMessages(activeUser);
+    } else {
+      fetch('/api/user-id/'+encodeURIComponent(activeUser))
+        .then(r=>r.json())
+        .then(d => {
+          if (d.user_id) loadStoriesById(d.user_id);
+          else { hideLoading(); pane.className='messages'; pane.innerHTML='<div style="color:#444;padding:20px">No stories for this user</div>'; }
+        });
+    }
+  }, 0);
+
 }
 
 // ── Load messages ────────────────────────────────────────────────────────────
 const TYPE_LABELS = {
-  STATUS_CALL_MISSED_AUDIO: 'MISSED CALL',
-  STATUS_CALL_MISSED_VIDEO: 'MISSED VIDEO CALL',
-  STATUS_CONVERSATION_CAPTURE_SCREENSHOT: 'SCREENSHOT TAKEN',
-  STATUS_SAVE_TO_CAMERA_ROLL: 'SAVED TO CAMERA ROLL',
-  STATUS_SNAP_REMIX_CAPTURE: 'REMIX CAPTURE',
+  STATUS_CALL_MISSED_AUDIO: 'Missed audio call',
+  STATUS_CALL_MISSED_VIDEO: 'Missed video call',
+  STATUS_CONVERSATION_CAPTURE_SCREENSHOT: 'Screenshot taken',
+  STATUS_SAVE_TO_CAMERA_ROLL: 'Saved to camera roll',
+  STATUS_SNAP_REMIX_CAPTURE: 'Remix captured',
   EXTERNAL_MEDIA: 'MEDIA',
   SNAP: 'SNAP',
   CHAT: 'CHAT',
@@ -543,15 +638,60 @@ const TYPE_LABELS = {
   SHARE: 'SHARE',
 };
 
+let ownerUsername = null;
+
+function showLoading(label) {
+  let ov = document.getElementById('globalLoader');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'globalLoader';
+    ov.style.cssText = [
+      'position:fixed','top:50%','left:50%',
+      'transform:translate(-50%,-50%)',
+      'background:#1a1a2e','border:1px solid #a78bfa',
+      'border-radius:12px','padding:18px 28px',
+      'z-index:9999','display:flex','align-items:center','gap:12px',
+      'box-shadow:0 4px 32px rgba(0,0,0,.6)'
+    ].join(';');
+    document.body.appendChild(ov);
+  }
+  ov.innerHTML = '<div style="width:22px;height:22px;border:3px solid #333;border-top-color:#a78bfa;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0"></div>'
+    + '<span style="color:#a78bfa;font-size:0.85rem">' + (label||'Loading\u2026') + '</span>';
+  ov.style.display = 'flex';
+}
+
+function hideLoading() {
+  const ov = document.getElementById('globalLoader');
+  if (ov) ov.style.display = 'none';
+}
+
+async function ensureOwner() {
+  if (!ownerUsername) {
+    const d = await fetch('/api/owner').then(r=>r.json());
+    ownerUsername = d.username;
+  }
+}
+
 async function loadMessages(username) {
+  await ensureOwner();
   const msgs = await fetch('/api/conversation/'+encodeURIComponent(username)).then(r=>r.json());
+  hideLoading();
   const pane = document.getElementById('contentPane');
   if (!msgs.length) { pane.innerHTML = '<div style="color:#333;padding:20px">No messages</div>'; return; }
 
-  pane.innerHTML = msgs.map(m => {
+  let lastConvId = null;
+  let html = '';
+
+  msgs.forEach(m => {
     const isStatus = m.type.startsWith('STATUS_');
     const pillClass = isStatus ? 'pill-STATUS' : ('pill-' + m.type);
     const label = TYPE_LABELS[m.type] || m.type;
+
+    // Conversation separator when conv_id changes
+    if (m.conv_id !== lastConvId) {
+      if (lastConvId !== null) html += `<div class="conv-sep">─── new conversation ───</div>`;
+      lastConvId = m.conv_id;
+    }
 
     const badges = [
       m.deleted   ? '<span class="badge b-deleted">deleted</span>' : '',
@@ -565,32 +705,128 @@ async function loadMessages(username) {
     if (m.text) {
       bodyHtml = `<span class="msg-text">${esc(m.text)}</span>`;
     } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && m.snap_keys && m.snap_keys.length) {
-      bodyHtml = m.snap_keys.map(k=>`<span class="snap-key" title="Media key">${esc(k)}</span>`).join('');
-      bodyHtml += `<span style="color:#1e6a9e;font-size:0.72rem">${m.type==='SNAP'?'(snap photo/video)':'(external media)'}</span>`;
+      bodyHtml = m.snap_keys.map(k=>`<span class="snap-key">${esc(k)}</span>`).join('');
     } else if (isStatus) {
-      bodyHtml = `<span style="color:#333;font-size:0.75rem;font-style:italic">${label}</span>`;
+      bodyHtml = `<span style="color:#333;font-size:0.73rem;font-style:italic">${esc(label)}</span>`;
     } else {
-      bodyHtml = `<span style="color:#2a2a2a;font-size:0.73rem">${label}</span>`;
+      bodyHtml = '';
     }
 
-    return `<div class="msg">
-      <span class="msg-ts">${m.ts}</span>
-      <div class="msg-body">
-        <span class="type-pill ${pillClass}">${label}</span>${badges}
-        ${bodyHtml}
-      </div>
-    </div>`;
-  }).join('');
+    if (isStatus) {
+      html += `<div class="msg-row status-row">
+        <div class="msg-bubble">
+          <span class="type-pill pill-STATUS">${esc(label)}</span>
+          ${badges}${bodyHtml}
+          <span class="msg-ts" style="margin-left:4px">${m.ts}</span>
+        </div>
+      </div>`;
+    } else {
+      const side = m.is_me ? 'me' : 'them';
+      const senderLabel = m.is_me ? 'You' : esc(m.sender);
+      html += `<div class="msg-row ${side}">
+        <div class="msg-sender">${senderLabel}</div>
+        <div class="msg-bubble">
+          <span class="type-pill ${pillClass}">${label}</span>${badges}
+          ${bodyHtml}
+        </div>
+        <div class="msg-meta"><span class="msg-ts">${m.ts}</span></div>
+      </div>`;
+    }
+  });
 
+  pane.innerHTML = html;
   pane.scrollTop = pane.scrollHeight;
+}
+
+let _matchEls = [];
+let _matchIdx = -1;
+
+function filterMessages(q) {
+  const pane = document.getElementById('contentPane');
+  const countEl = document.getElementById('msgSearchCount');
+  const prevBtn = document.getElementById('prevMatch');
+  const nextBtn = document.getElementById('nextMatch');
+
+  // Clear previous highlights
+  pane.querySelectorAll('.msg-row').forEach(r => restoreHighlights(r));
+  _matchEls = [];
+  _matchIdx = -1;
+
+  if (!q.trim()) {
+    if (countEl) countEl.textContent = '';
+    if (prevBtn) prevBtn.style.display = 'none';
+    if (nextBtn) nextBtn.style.display = 'none';
+    return;
+  }
+
+  const re = new RegExp(escRe(q), 'gi');
+  pane.querySelectorAll('.msg-text').forEach(textEl => {
+    const orig = textEl.textContent;
+    if (!orig.toLowerCase().includes(q.toLowerCase())) return;
+    textEl.innerHTML = orig.replace(re, m => `<mark class="highlight">${esc(m)}</mark>`);
+    textEl.querySelectorAll('.highlight').forEach(el => _matchEls.push(el));
+  });
+
+  const count = _matchEls.length;
+  if (countEl) countEl.textContent = count ? `1 / ${count}` : 'No results';
+  if (prevBtn) prevBtn.style.display = count ? '' : 'none';
+  if (nextBtn) nextBtn.style.display = count ? '' : 'none';
+
+  if (count) { _matchIdx = 0; scrollToMatch(); }
+}
+
+function stepMatch(dir) {
+  if (!_matchEls.length) return;
+  _matchIdx = (_matchIdx + dir + _matchEls.length) % _matchEls.length;
+  scrollToMatch();
+  const countEl = document.getElementById('msgSearchCount');
+  if (countEl) countEl.textContent = `${_matchIdx + 1} / ${_matchEls.length}`;
+}
+
+function scrollToMatch() {
+  _matchEls.forEach((el, i) => el.classList.toggle('active-match', i === _matchIdx));
+  const active = _matchEls[_matchIdx];
+  if (active) active.scrollIntoView({behavior:'smooth', block:'center'});
+}
+
+function filterStories(q) {
+  const pane = document.getElementById('contentPane');
+  const countEl = document.getElementById('msgSearchCount');
+  const cards = pane.querySelectorAll('.story-card');
+  if (!q.trim()) {
+    cards.forEach(c => c.style.display = '');
+    if (countEl) countEl.textContent = '';
+    return;
+  }
+  const lower = q.toLowerCase();
+  let matches = 0;
+  cards.forEach(card => {
+    const meta = card.querySelector('.story-meta');
+    const text = meta ? meta.textContent.toLowerCase() : '';
+    const visible = text.includes(lower);
+    card.style.display = visible ? '' : 'none';
+    if (visible) matches++;
+  });
+  if (countEl) countEl.textContent = matches ? `${matches} result${matches>1?'s':''}` : 'No results';
+}
+
+function restoreHighlights(row) {
+  const marks = row.querySelectorAll('mark.highlight');
+  marks.forEach(m => m.replaceWith(document.createTextNode(m.textContent)));
+}
+
+function escRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // ── Load stories by user_id ──────────────────────────────────────────────────
 async function loadStoriesById(userId) {
   const stories = await fetch('/api/stories/'+encodeURIComponent(userId)).then(r=>r.json());
+  hideLoading();
   const pane = document.getElementById('contentPane');
-  if (!stories.length) { pane.innerHTML = '<div style="color:#444;padding:20px">No stories</div>'; return; }
+  if (!stories.length) { pane.className='messages'; pane.innerHTML = '<div style="color:#444;padding:20px">No stories</div>'; return; }
 
+  pane.className = 'stories-grid';
   pane.innerHTML = stories.map(s => {
     const mediaEl = s.is_video
       ? `<video class="story-thumb-video" src="${esc(s.url)}" preload="metadata" muted></video>`
