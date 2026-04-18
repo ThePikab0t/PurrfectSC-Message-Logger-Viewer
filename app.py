@@ -1,8 +1,12 @@
 import sqlite3
 import json
 import re
+import base64
+import urllib.request
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string, Response
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 app = Flask(__name__)
 DB_PATH = "/home/hack3r/Web/PurrfectSC/message_loggerr.db"
@@ -36,6 +40,133 @@ _SYSTEM_STRINGS = {
     "UNKNOWN", "NONE", "NORMAL", "STATUS", "OPEN", "CLOSED",
     "TRUE", "FALSE", "NULL", "SAVE_POLICY", "ERASABLE", "SAVEABLE",
 }
+
+BOLT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.3"
+)
+
+
+# ── Protobuf helpers (no external deps) ──────────────────────────────────────
+
+def _read_varint(data, pos):
+    result = shift = 0
+    while pos < len(data):
+        b = data[pos]; pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return result, pos
+
+
+def _proto_fields(data):
+    fields = {}
+    pos = 0
+    while pos < len(data):
+        try:
+            tag, pos = _read_varint(data, pos)
+        except Exception:
+            break
+        field_num = tag >> 3
+        wire_type = tag & 0x7
+        try:
+            if wire_type == 0:
+                val, pos = _read_varint(data, pos)
+                fields.setdefault(field_num, []).append(("varint", val))
+            elif wire_type == 2:
+                length, pos = _read_varint(data, pos)
+                val = data[pos:pos + length]; pos += length
+                fields.setdefault(field_num, []).append(("bytes", val))
+            elif wire_type == 5:
+                fields.setdefault(field_num, []).append(("fixed32", data[pos:pos+4])); pos += 4
+            elif wire_type == 1:
+                fields.setdefault(field_num, []).append(("fixed64", data[pos:pos+8])); pos += 8
+            else:
+                break
+        except Exception:
+            break
+    return fields
+
+
+def _follow_proto(data, path):
+    cur = data
+    for field_num in path:
+        fields = _proto_fields(cur)
+        entries = fields.get(field_num, [])
+        if not entries:
+            return None
+        wt, val = entries[0]
+        if wt != "bytes":
+            return None
+        cur = val
+    return cur
+
+
+def _decode_enc_pair(data):
+    """Extract (key_bytes, iv_bytes) from a proto with field 1=key and field 2=iv."""
+    ef = _proto_fields(data)
+    k = ef.get(1, [None])[0]
+    v = ef.get(2, [None])[0]
+    if not k or not v:
+        return None, None
+    try:
+        key = base64.b64decode(k[1].strip())
+        iv  = base64.b64decode(v[1].strip())
+        return key, iv
+    except Exception:
+        # raw bytes fallback
+        if k[0] == "bytes" and v[0] == "bytes":
+            return k[1], v[1]
+    return None, None
+
+
+def extract_snap_bolt(message_data_blob):
+    """Return (bolt_key_b64url, key_bytes|None, iv_bytes|None) for a SNAP/EXTERNAL_MEDIA msg."""
+    try:
+        data = json.loads(message_data_blob)
+        content = data.get("mMessageContent", {})
+
+        # Bolt key from mRemoteMediaReferences[*].mMediaReferences[*].mContentObject
+        bolt_key = None
+        for ref in content.get("mRemoteMediaReferences", []):
+            for mref in ref.get("mMediaReferences", []):
+                obj = mref.get("mContentObject", [])
+                if obj:
+                    b = bytes([x % 256 for x in obj])
+                    bolt_key = base64.urlsafe_b64encode(b).decode()
+                    break
+            if bolt_key:
+                break
+        if not bolt_key:
+            return None, None, None
+
+        # Encryption key/iv from mContent protobuf
+        content_arr = content.get("mContent", [])
+        if not content_arr:
+            return bolt_key, None, None
+        proto = bytes([x % 256 for x in content_arr])
+
+        # SNAP path  [11,5,1,1,4]  (base64-encoded key/iv strings)
+        for path in ([11, 5, 1, 1, 4], [11, 5, 1, 1, 19]):
+            enc = _follow_proto(proto, path)
+            if enc:
+                key, iv = _decode_enc_pair(enc)
+                if key and iv:
+                    return bolt_key, key, iv
+
+        # EXTERNAL_MEDIA path  [3,3,5,1,1,4]
+        for path in ([3, 3, 5, 1, 1, 4], [3, 3, 5, 1, 1, 19]):
+            enc = _follow_proto(proto, path)
+            if enc:
+                key, iv = _decode_enc_pair(enc)
+                if key and iv:
+                    return bolt_key, key, iv
+
+        return bolt_key, None, None
+    except Exception:
+        return None, None, None
 
 
 def extract_chat_text(message_data_blob):
@@ -336,6 +467,145 @@ def api_conversation(username):
     return jsonify([_parse_message(r, owner) for r in rows])
 
 
+def _detect_media(data, fallback_ct="application/octet-stream"):
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg", "image/jpeg"
+    if data[:4] == b"\x89PNG":
+        return "png", "image/png"
+    if data[:3] == b"GIF":
+        return "gif", "image/gif"
+    if data[4:8] in (b"ftyp", b"mdat", b"moov") or data[:4] in (
+        b"\x00\x00\x00\x18", b"\x00\x00\x00\x1c", b"\x00\x00\x00\x20",
+        b"\x00\x00\x00\x14", b"\x00\x00\x00\x08",
+    ):
+        return "mp4", "video/mp4"
+    return "bin", fallback_ct
+
+
+def _unwrap_snap(data, fallback_ct="application/octet-stream"):
+    """Unwrap Snapchat's overlay ZIP container if present, return (bytes, ext, ct)."""
+    import zipfile, io
+    if data[:2] == b"PK":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = zf.namelist()
+                # Find the media entry (not the overlay)
+                media_name = next(
+                    (n for n in names if n.startswith("media")),
+                    names[0] if names else None,
+                )
+                if media_name:
+                    inner = zf.read(media_name)
+                    ext, ct = _detect_media(inner, fallback_ct)
+                    return inner, ext, ct
+        except Exception:
+            pass
+    ext, ct = _detect_media(data, fallback_ct)
+    return data, ext, ct
+
+
+@app.route("/api/snap-info/<int:msg_id>")
+def api_snap_info(msg_id):
+    """Return bolt_key and whether encryption keys are available."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT message_data FROM messages WHERE id = ?", (msg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    bolt_key, key_bytes, iv_bytes = extract_snap_bolt(row["message_data"])
+    return jsonify({
+        "bolt_key": bolt_key,
+        "has_encryption": bool(key_bytes and iv_bytes),
+    })
+
+
+@app.route("/api/snap-download/<int:msg_id>")
+def api_snap_download(msg_id):
+    """Proxy-download a snap: resolve via Bolt, decrypt with AES-CBC, stream to browser."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT message_data FROM messages WHERE id = ?", (msg_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+
+    bolt_key, key_bytes, iv_bytes = extract_snap_bolt(row["message_data"])
+    if not bolt_key:
+        return jsonify({"error": "no media in this message"}), 400
+
+    bolt_url = f"https://gcp.api.snapchat.com/bolt-http/resolve?co={bolt_key}"
+    try:
+        req = urllib.request.Request(bolt_url, headers={"User-Agent": BOLT_UA})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw_bytes = resp.read()
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+    except Exception as e:
+        return jsonify({"error": f"fetch failed: {e}"}), 502
+
+    if key_bytes and iv_bytes:
+        try:
+            cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
+            raw_bytes = unpad(cipher.decrypt(raw_bytes), AES.block_size)
+        except Exception:
+            pass
+
+    raw_bytes, ext, ct = _unwrap_snap(raw_bytes, content_type)
+
+    r = Response(raw_bytes, mimetype=ct)
+    r.headers["Content-Disposition"] = f'attachment; filename="snap_{msg_id}.{ext}"'
+    return r
+
+
+@app.route("/api/story-download")
+def api_story_download():
+    """Download and decrypt a story from its CDN URL."""
+    url = request.args.get("url", "")
+    user_id = request.args.get("user_id", "")
+    ts = request.args.get("ts", "")
+    if not url:
+        return jsonify({"error": "url required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    # Query by URL only — user_id is a hint, not required
+    cur.execute(
+        "SELECT encryption_key, encryption_iv FROM stories WHERE url = ? LIMIT 1",
+        (url,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": BOLT_UA})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw_bytes = resp.read()
+    except Exception as e:
+        return jsonify({"error": f"fetch failed: {e}"}), 502
+
+    decrypted = False
+    if row and row[0] and row[1]:
+        try:
+            key_b = bytes(row[0]) if not isinstance(row[0], (bytes, bytearray)) else row[0]
+            iv_b  = bytes(row[1]) if not isinstance(row[1], (bytes, bytearray)) else row[1]
+            cipher = AES.new(key_b, AES.MODE_CBC, iv_b)
+            raw_bytes = unpad(cipher.decrypt(raw_bytes), AES.block_size)
+            decrypted = True
+        except Exception as e:
+            app.logger.warning(f"Story decrypt failed for {url}: {e}")
+
+    raw_bytes, ext, ct = _unwrap_snap(raw_bytes)
+
+    # Sanitize ts for use in filename
+    safe_ts = re.sub(r"[^\w\-]", "_", ts or "story")[:30]
+    fname = f"story_{safe_ts}.{ext}"
+    r = Response(raw_bytes, mimetype=ct)
+    r.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+    return r
+
+
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -425,14 +695,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .nav-btn:hover{border-color:#a78bfa;color:#a78bfa}
 
   /* Stories grid */
-  .stories-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;align-content:start}
-  .story-card{background:#161616;border-radius:8px;overflow:hidden;border:1px solid #222;cursor:pointer}
-  .story-thumb{width:100%;height:150px;object-fit:cover;display:block;background:#1a1a1a}
-  .story-thumb-video{width:100%;height:150px;object-fit:cover;display:block;background:#0d1520}
+  .stories-grid{flex:1;overflow-y:auto;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,160px);grid-auto-rows:260px;gap:10px;align-content:start;justify-content:start}
+  .story-card{background:#161616;border-radius:8px;overflow:hidden;border:1px solid #222;cursor:pointer;width:160px;height:260px;display:flex;flex-direction:column}
+  .story-thumb{width:160px;height:200px;object-fit:cover;display:block;flex-shrink:0}
+  .story-thumb-video{width:160px;height:200px;object-fit:cover;display:block;flex-shrink:0}
   .story-type-badge{position:absolute;top:5px;left:5px;font-size:0.6rem;padding:2px 5px;border-radius:3px;background:rgba(0,0,0,0.7);color:#fff}
-  .story-wrap{position:relative}
-  .story-meta{padding:5px 7px;font-size:0.65rem;color:#444}
+  .story-wrap{position:relative;width:160px;height:200px;flex-shrink:0;overflow:hidden}
+  .story-meta{padding:4px 7px;font-size:0.65rem;color:#444;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}
   .story-open-btn{display:block;width:100%;padding:4px;text-align:center;font-size:0.7rem;color:#a78bfa;background:#1a0f2e;border:none;cursor:pointer;border-top:1px solid #222}
+  .story-thumb-placeholder{width:160px;height:200px;display:flex;align-items:center;justify-content:center;font-size:2.5rem;background:#111;color:#444;flex-shrink:0}
+  .stories-load-more{grid-column:1/-1;padding:10px;text-align:center}
+  .stories-load-more button{padding:7px 24px;background:#1a1a2e;border:1px solid #a78bfa;color:#a78bfa;border-radius:7px;cursor:pointer;font-size:0.8rem}
+  .stories-load-more button:hover{background:#2a1f4a}
+  .story-btn-row{display:flex;border-top:1px solid #222}
+  .story-btn-row a{flex:1;padding:4px;text-align:center;font-size:0.7rem;color:#a78bfa;background:#1a0f2e;text-decoration:none}
+  .story-btn-row a+a{border-left:1px solid #222}
+  .story-btn-row a:hover{background:#2a1f4a}
+  .story-modal{position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9000;display:flex;align-items:center;justify-content:center}
+  .story-modal-box{display:flex;flex-direction:column;max-width:92vw;max-height:94vh;background:#141414;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden}
+  .story-modal-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:#1a1a1a;border-bottom:1px solid #222;flex-shrink:0}
+  .story-modal-ts{font-size:0.75rem;color:#555;flex:1}
+  .story-modal-dl{font-size:0.75rem;color:#38bdf8;text-decoration:none;padding:3px 10px;border:1px solid #1e3a5a;border-radius:5px;background:#0d1a2e}
+  .story-modal-dl:hover{background:#1a2e4a}
+  .story-modal-close{background:transparent;border:1px solid #333;color:#888;border-radius:5px;padding:3px 8px;cursor:pointer;font-size:0.8rem}
+  .story-modal-close:hover{border-color:#f87171;color:#f87171}
+  .story-modal-media{display:flex;align-items:center;justify-content:center;min-width:300px;min-height:200px;overflow:auto}
+  .story-modal-content{max-width:90vw;max-height:85vh;object-fit:contain;display:block}
+  .dl-btn{font-size:0.7rem;padding:2px 7px;border-radius:4px;background:#0d1a2e;color:#38bdf8;text-decoration:none;border:1px solid #1e3a5a;margin-left:4px;display:inline-block;vertical-align:middle}
+  .dl-btn:hover{background:#1a2e4a;color:#7dd3fc}
 
   .placeholder{flex:1;display:flex;align-items:center;justify-content:center;color:#2a2a2a;font-size:0.9rem}
   ::-webkit-scrollbar{width:4px}
@@ -706,6 +996,9 @@ async function loadMessages(username) {
       bodyHtml = `<span class="msg-text">${esc(m.text)}</span>`;
     } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && m.snap_keys && m.snap_keys.length) {
       bodyHtml = m.snap_keys.map(k=>`<span class="snap-key">${esc(k)}</span>`).join('');
+      bodyHtml += ` <a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
+    } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && !m.text) {
+      bodyHtml = `<a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
     } else if (isStatus) {
       bodyHtml = `<span style="color:#333;font-size:0.73rem;font-style:italic">${esc(label)}</span>`;
     } else {
@@ -826,27 +1119,109 @@ function escRe(s) {
 }
 
 // ── Load stories by user_id ──────────────────────────────────────────────────
+const STORIES_PAGE = 50;
+
 async function loadStoriesById(userId) {
   const stories = await fetch('/api/stories/'+encodeURIComponent(userId)).then(r=>r.json());
   hideLoading();
   const pane = document.getElementById('contentPane');
-  if (!stories.length) { pane.style.cssText=''; pane.className='messages'; pane.innerHTML = '<div style="color:#444;padding:20px">No stories</div>'; return; }
+  if (!stories.length) { pane.style.cssText=''; pane.className='messages'; pane.innerHTML='<div style="color:#444;padding:20px">No stories</div>'; return; }
 
   pane.style.cssText = '';
   pane.className = 'stories-grid';
-  pane.innerHTML = stories.map(s => {
-    const mediaEl = s.is_video
-      ? `<video class="story-thumb-video" src="${esc(s.url)}" preload="metadata" muted></video>`
-      : `<img class="story-thumb" src="${esc(s.url)}" loading="lazy" onerror="this.style.opacity='0.1'">`;
-    return `<div class="story-card">
-      <div class="story-wrap">
-        <a href="${esc(s.url)}" target="_blank" rel="noopener">${mediaEl}</a>
-        <span class="story-type-badge">${s.is_video ? '▶ Video' : '🖼 Image'}</span>
+  window._currentStories = stories;
+  window._currentStoriesUserId = userId;
+  window._storiesOffset = 0;
+  pane.innerHTML = '';
+  renderStoryPage(pane);
+}
+
+function storyCardHtml(s, i) {
+  const userId = window._currentStoriesUserId;
+  const proxyUrl = `/api/story-download?url=${encodeURIComponent(s.url)}&user_id=${encodeURIComponent(userId)}&ts=${encodeURIComponent(s.posted||s.added)}`;
+  const typeIcon = s.is_video ? '▶' : '🖼';
+  return `<div class="story-card" onclick="openStoryViewer(${i})">
+    <div class="story-wrap">
+      <div class="story-thumb-placeholder">${typeIcon}</div>
+      <span class="story-type-badge">${s.is_video ? '▶ Video' : '🖼 Image'}</span>
+    </div>
+    <div class="story-meta">${esc(s.posted||s.added)}</div>
+    <div class="story-btn-row" onclick="event.stopPropagation()">
+      <a href="${proxyUrl}" download>⬇ Save</a>
+    </div>
+  </div>`;
+}
+
+function renderStoryPage(pane) {
+  const stories = window._currentStories;
+  const offset = window._storiesOffset;
+  const slice = stories.slice(offset, offset + STORIES_PAGE);
+
+  // Remove old load-more button if present
+  const old = pane.querySelector('.stories-load-more');
+  if (old) old.remove();
+
+  pane.insertAdjacentHTML('beforeend', slice.map((s, j) => storyCardHtml(s, offset + j)).join(''));
+  window._storiesOffset += slice.length;
+
+  if (window._storiesOffset < stories.length) {
+    const remaining = stories.length - window._storiesOffset;
+    pane.insertAdjacentHTML('beforeend',
+      `<div class="stories-load-more"><button onclick="renderStoryPage(document.getElementById('contentPane'))">Load ${Math.min(remaining, STORIES_PAGE)} more (${remaining} left)</button></div>`);
+  }
+}
+
+function openStoryViewer(idx) {
+  const s = window._currentStories[idx];
+  const userId = window._currentStoriesUserId;
+  if (!s) return;
+  const url = s.url, isVideo = s.is_video, ts = s.posted || s.added;
+  const proxyUrl = `/api/story-download?url=${encodeURIComponent(url)}&user_id=${encodeURIComponent(userId)}&ts=${encodeURIComponent(ts)}`;
+  let modal = document.getElementById('storyModal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'storyModal';
+    document.body.appendChild(modal);
+  }
+  modal.className = 'story-modal';
+  modal.onclick = e => { if (e.target === modal) closeStoryViewer(); };
+  modal.innerHTML = `
+    <div class="story-modal-box">
+      <div class="story-modal-bar">
+        <span class="story-modal-ts">${esc(ts)}</span>
+        <a class="story-modal-dl" href="${proxyUrl}" download>⬇ Save</a>
+        <button class="story-modal-close" onclick="closeStoryViewer()">✕</button>
       </div>
-      <div class="story-meta">${s.posted||s.added}</div>
-      <a href="${esc(s.url)}" target="_blank" rel="noopener" class="story-open-btn">Open</a>
+      <div class="story-modal-media" id="storyModalMedia">
+        <div class="spinner"></div>
+      </div>
     </div>`;
-  }).join('');
+  modal.style.display = 'flex';
+
+  const container = document.getElementById('storyModalMedia');
+  if (isVideo) {
+    const v = document.createElement('video');
+    v.src = proxyUrl; v.controls = true; v.autoplay = true;
+    v.className = 'story-modal-content';
+    v.oncanplay = () => { const sp = container.querySelector('.spinner'); if(sp) sp.remove(); };
+    v.onerror = () => { container.innerHTML = '<span style="color:#f87171;padding:20px">Failed to load — server may be offline</span>'; };
+    container.appendChild(v);
+  } else {
+    const img = document.createElement('img');
+    img.src = proxyUrl;
+    img.className = 'story-modal-content';
+    img.onload = () => { const sp = container.querySelector('.spinner'); if(sp) sp.remove(); };
+    img.onerror = () => { container.innerHTML = '<span style="color:#f87171;padding:20px">Failed to load — server may be offline</span>'; };
+    container.appendChild(img);
+  }
+}
+
+function closeStoryViewer() {
+  const modal = document.getElementById('storyModal');
+  if (!modal) return;
+  modal.querySelectorAll('video').forEach(v => { v.pause(); v.src = ''; });
+  modal.style.display = 'none';
+  modal.innerHTML = '';
 }
 
 // ── Search ───────────────────────────────────────────────────────────────────
