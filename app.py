@@ -1,7 +1,9 @@
+import os
 import sqlite3
 import json
 import re
 import base64
+import uuid
 import urllib.request
 from datetime import datetime
 from flask import Flask, jsonify, request, render_template_string, Response
@@ -9,7 +11,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 app = Flask(__name__)
-DB_PATH = "/home/hack3r/Web/PurrfectSC/message_loggerr.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "message_loggerr.db")
 
 VIDEO_PREFIXES = {"/4/", "/3/", "/u/"}
 
@@ -169,38 +171,80 @@ def extract_snap_bolt(message_data_blob):
         return None, None, None
 
 
+def _decode_text_array(content_arr):
+    if not content_arr:
+        return ""
+    b = bytes([x % 256 for x in content_arr])
+    # Match printable ASCII + common extended latin
+    strings = re.findall(rb"[\x20-\x7e\xc0-\xff]{2,}", b)
+    results = []
+    for s in strings:
+        try:
+            decoded = s.decode("utf-8", errors="replace")
+        except Exception:
+            decoded = s.decode("latin-1")
+        # Skip base64/binary blobs
+        if re.match(r"^[A-Za-z0-9+/=]{20,}$", decoded):
+            continue
+        # Skip UUIDs
+        if re.match(r"^[0-9a-f\-]{32,}$", decoded):
+            continue
+        # Skip known system enum strings
+        if decoded.strip() in _SYSTEM_STRINGS:
+            continue
+        # Skip strings with no lowercase (all-caps system tokens)
+        if len(decoded) <= 10 and decoded.isupper():
+            continue
+        if len(decoded) >= 2:
+            results.append(decoded)
+    return " ".join(results).strip()
+
+
 def extract_chat_text(message_data_blob):
     try:
         data = json.loads(message_data_blob)
         content = data.get("mMessageContent", {}).get("mContent", [])
-        if not content:
-            return ""
-        b = bytes([x % 256 for x in content])
-        # Match printable ASCII + common extended latin
-        strings = re.findall(rb"[\x20-\x7e\xc0-\xff]{2,}", b)
-        results = []
-        for s in strings:
-            try:
-                decoded = s.decode("utf-8", errors="replace")
-            except Exception:
-                decoded = s.decode("latin-1")
-            # Skip base64/binary blobs
-            if re.match(r"^[A-Za-z0-9+/=]{20,}$", decoded):
-                continue
-            # Skip UUIDs
-            if re.match(r"^[0-9a-f\-]{32,}$", decoded):
-                continue
-            # Skip known system enum strings
-            if decoded.strip() in _SYSTEM_STRINGS:
-                continue
-            # Skip strings with no lowercase (all-caps system tokens)
-            if len(decoded) <= 10 and decoded.isupper():
-                continue
-            if len(decoded) >= 2:
-                results.append(decoded)
-        return " ".join(results).strip()
+        return _decode_text_array(content)
     except Exception:
         return ""
+
+
+def _uuid_from_id_obj(id_obj):
+    """Snapchat stores UUIDs as a signed-byte array under mId; convert to a UUID string."""
+    try:
+        arr = id_obj.get("mId")
+        if not arr:
+            return None
+        b = bytes([x % 256 for x in arr])
+        return str(uuid.UUID(bytes=b))
+    except Exception:
+        return None
+
+
+def extract_quote_info(message_data_blob):
+    """If this message is a reply, return info about the message it quotes."""
+    try:
+        data = json.loads(message_data_blob)
+    except Exception:
+        return None
+    qm = data.get("mMessageContent", {}).get("mQuotedMessage")
+    if not qm:
+        return None
+
+    qc = qm.get("mContent")
+    if not qc:
+        return {"available": False, "message_id": None, "sender_user_id": None,
+                "type": None, "text": ""}
+
+    content_type = qc.get("mContentType", "UNKNOWN")
+    text = _decode_text_array(qc.get("mContent")) if content_type == "CHAT" else ""
+    return {
+        "available": qm.get("mStatus") == "AVAILABLE",
+        "message_id": qc.get("mMessageId"),
+        "sender_user_id": _uuid_from_id_obj(qc.get("mSenderId", {})),
+        "type": content_type,
+        "text": text,
+    }
 
 
 def extract_snap_key(message_data_blob):
@@ -406,8 +450,10 @@ def _parse_message(r, owner):
         snap_keys = extract_snap_key(r["message_data"])
 
     sender = r["username"]
+    quote = extract_quote_info(r["message_data"])
     return {
         "id": r["id"],
+        "message_id": r["message_id"],
         "sender": sender,
         "is_me": sender == owner,
         "ts": fmt_ts(r["send_timestamp"]),
@@ -422,6 +468,7 @@ def _parse_message(r, owner):
         "saved": len(meta.get("mSavedBy", [])) > 0,
         "screenshot": len(meta.get("mScreenShottedBy", [])) > 0,
         "conv_id": r["conversation_id"],
+        "quote": quote,
     }
 
 
@@ -462,9 +509,44 @@ def api_conversation(username):
         conv_ids,
     )
     rows = cur.fetchall()
+
+    parsed = [_parse_message(r, owner) for r in rows]
+
+    # Resolve quoted-message senders (username) and prefer the locally-known
+    # copy of the quoted message's text (handles edits/deletions consistently).
+    by_msgid = {p["message_id"]: p for p in parsed if p["message_id"] is not None}
+    unresolved_uids = {
+        p["quote"]["sender_user_id"]
+        for p in parsed
+        if p["quote"] and p["quote"].get("sender_user_id")
+        and p["quote"]["message_id"] not in by_msgid
+    }
+    uid_to_username = {}
+    if unresolved_uids:
+        placeholders = ",".join("?" * len(unresolved_uids))
+        cur.execute(
+            f"SELECT user_id, username FROM messages WHERE user_id IN ({placeholders}) GROUP BY user_id",
+            tuple(unresolved_uids),
+        )
+        uid_to_username = {row["user_id"]: row["username"] for row in cur.fetchall()}
+
     conn.close()
 
-    return jsonify([_parse_message(r, owner) for r in rows])
+    for p in parsed:
+        q = p["quote"]
+        if not q:
+            continue
+        target = by_msgid.get(q["message_id"])
+        if target:
+            q["sender"] = target["sender"]
+            q["text"] = target["text"]
+            q["type"] = target["type"]
+            q["deleted"] = target["deleted"]
+        else:
+            q["sender"] = uid_to_username.get(q["sender_user_id"])
+            q["deleted"] = not q["available"]
+
+    return jsonify(parsed)
 
 
 def _detect_media(data, fallback_ct="application/octet-stream"):
@@ -660,6 +742,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .msg-bubble{padding:6px 10px;border-radius:12px;max-width:100%;word-break:break-word}
   .msg-row.me .msg-bubble{background:#2a1f4a;border-bottom-right-radius:3px}
   .msg-row.them .msg-bubble{background:#1e1e1e;border-bottom-left-radius:3px}
+  .msg-quote{display:block;border-left:3px solid #a78bfa;background:rgba(167,139,250,0.08);border-radius:6px;padding:4px 8px;margin-bottom:5px;max-width:100%}
+  .msg-quote-sender{font-size:0.66rem;color:#a78bfa;font-weight:600;display:block}
+  .msg-quote-text{font-size:0.76rem;color:#888;display:block;white-space:pre-wrap;word-break:break-word}
+  .msg-quote-text.unavailable{font-style:italic;color:#555}
   .msg-row.status-row .msg-bubble{background:transparent;padding:2px 8px}
   .msg-text{font-size:0.84rem;color:#d0d0d0}
   .msg-row.me .msg-text{color:#c4b5fd}
@@ -991,19 +1077,38 @@ async function loadMessages(username) {
       m.has_audio ? '<span class="badge b-audio">audio</span>'     : '',
     ].join('');
 
-    let bodyHtml = '';
-    if (m.text) {
-      bodyHtml = `<span class="msg-text">${esc(m.text)}</span>`;
-    } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && m.snap_keys && m.snap_keys.length) {
-      bodyHtml = m.snap_keys.map(k=>`<span class="snap-key">${esc(k)}</span>`).join('');
-      bodyHtml += ` <a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
-    } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && !m.text) {
-      bodyHtml = `<a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
-    } else if (isStatus) {
-      bodyHtml = `<span style="color:#333;font-size:0.73rem;font-style:italic">${esc(label)}</span>`;
-    } else {
-      bodyHtml = '';
+    let quoteHtml = '';
+    if (m.quote) {
+      const q = m.quote;
+      const qSenderLabel = q.sender ? (q.sender === ownerUsername ? 'You' : q.sender) : 'Unknown user';
+      let qText;
+      if (!q.available || q.deleted) {
+        qText = '<span class="msg-quote-text unavailable">Original message no longer available</span>';
+      } else if (q.text) {
+        qText = `<span class="msg-quote-text">${esc(q.text)}</span>`;
+      } else {
+        qText = `<span class="msg-quote-text unavailable">[${esc(TYPE_LABELS[q.type] || q.type || 'message')}]</span>`;
+      }
+      quoteHtml = `<span class="msg-quote">
+        <span class="msg-quote-sender">↩ Replying to ${esc(qSenderLabel)}</span>
+        ${qText}
+      </span>`;
     }
+
+    let contentHtml = '';
+    if (m.text) {
+      contentHtml = `<span class="msg-text">${esc(m.text)}</span>`;
+    } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && m.snap_keys && m.snap_keys.length) {
+      contentHtml = m.snap_keys.map(k=>`<span class="snap-key">${esc(k)}</span>`).join('');
+      contentHtml += ` <a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
+    } else if ((m.type==='SNAP'||m.type==='EXTERNAL_MEDIA') && !m.text) {
+      contentHtml = `<a class="dl-btn" href="/api/snap-download/${m.id}" download title="Download snap">⬇ Download</a>`;
+    } else if (isStatus) {
+      contentHtml = `<span style="color:#333;font-size:0.73rem;font-style:italic">${esc(label)}</span>`;
+    } else {
+      contentHtml = '';
+    }
+    let bodyHtml = quoteHtml + contentHtml;
 
     if (isStatus) {
       html += `<div class="msg-row status-row">
