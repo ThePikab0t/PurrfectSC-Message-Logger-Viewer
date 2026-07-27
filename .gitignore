@@ -1,4 +1,7 @@
 venv/
+# database folder (large exports / master archive) - never push these
+dbs/
+DBs/
 *.db
 *.mp4
 pdbbam944MQcIvR9iv0Br

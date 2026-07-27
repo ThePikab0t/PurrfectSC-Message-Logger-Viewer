@@ -1,4 +1,5 @@
 import sqlite3
+import os
 import json
 import re
 import base64
@@ -9,8 +10,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 app = Flask(__name__)
-DB_PATH = "/home/hack3r/Web/PurrfectSC/message_loggerr.db"
-
+# DB_PATH = "/home/hack3r/Web/PurrfectSC/message_loggerr.db"
+# Merged master archive (all history, deduped by message_id / story url). Rebuild via scripts/merge_master.py.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DBs", "message_logger_master.db")
 VIDEO_PREFIXES = {"/4/", "/3/", "/u/"}
 
 
