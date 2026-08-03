@@ -3,6 +3,7 @@ import os
 import json
 import re
 import base64
+import uuid
 import urllib.request
 from datetime import datetime
 from flask import Flask, jsonify, request, render_template_string, Response
@@ -10,9 +11,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 app = Flask(__name__)
-# DB_PATH = "/home/hack3r/Web/PurrfectSC/message_loggerr.db"
+DB_PATH = "G:\message_logger_master.db"
 # Merged master archive (all history, deduped by message_id / story url). Rebuild via scripts/merge_master.py.
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DBs", "message_logger_master.db")
+# DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DBs", "message_logger_master.db")
 VIDEO_PREFIXES = {"/4/", "/3/", "/u/"}
 
 
@@ -171,13 +172,37 @@ def extract_snap_bolt(message_data_blob):
         return None, None, None
 
 
-def extract_chat_text(message_data_blob):
+def _arr_to_bytes(arr):
+    return bytes([x % 256 for x in arr])
+
+
+def _arr_to_uuid(arr):
     try:
-        data = json.loads(message_data_blob)
-        content = data.get("mMessageContent", {}).get("mContent", [])
-        if not content:
-            return ""
-        b = bytes([x % 256 for x in content])
+        return str(uuid.UUID(bytes=_arr_to_bytes(arr)))
+    except Exception:
+        return None
+
+
+def decode_chat_bytes(b):
+    """Decode CHAT text from the mContent protobuf.
+
+    Field path [2,1] holds the UTF-8 text; it resolves for every CHAT message
+    tested and keeps emoji intact. Falls back to the printable-string scan for
+    anything that doesn't follow that shape.
+    """
+    if not b:
+        return ""
+    try:
+        raw = _follow_proto(b, [2, 1])
+        if raw is not None:
+            return raw.decode("utf-8").strip()
+    except Exception:
+        pass
+    return _scan_printable(b)
+
+
+def _scan_printable(b):
+    try:
         # Match printable ASCII + common extended latin
         strings = re.findall(rb"[\x20-\x7e\xc0-\xff]{2,}", b)
         results = []
@@ -201,6 +226,14 @@ def extract_chat_text(message_data_blob):
             if len(decoded) >= 2:
                 results.append(decoded)
         return " ".join(results).strip()
+    except Exception:
+        return ""
+
+
+def extract_chat_text(message_data_blob):
+    try:
+        data = json.loads(message_data_blob)
+        return decode_chat_bytes(_arr_to_bytes(data.get("mMessageContent", {}).get("mContent", [])))
     except Exception:
         return ""
 
@@ -388,37 +421,72 @@ def api_owner():
     return jsonify({"username": row["username"] if row else None})
 
 
-def _parse_message(r, owner):
+def _extract_quoted(content):
+    """Pull the replied-to message out of mQuotedMessage, if any."""
+    quoted = content.get("mQuotedMessage")
+    if not quoted:
+        return None
+
+    inner = quoted.get("mContent")
+    if not inner:
+        # Snapchat kept the reply marker but not the quoted payload.
+        return {"unavailable": True} if quoted.get("mStatus") else None
+
+    q_type = inner.get("mContentType", "UNKNOWN")
+    q_text = ""
+    if q_type == "CHAT":
+        q_text = decode_chat_bytes(_arr_to_bytes(inner.get("mContent", [])))
+
+    return {
+        "unavailable": False,
+        "arroyo_id": inner.get("mMessageId"),
+        "sender_uid": _arr_to_uuid(inner.get("mSenderId", {}).get("mId", [])),
+        "type": q_type,
+        "text": q_text,
+        "ts": fmt_ts(inner.get("mCreatedAt")),
+        "ts_raw": inner.get("mCreatedAt"),
+    }
+
+
+def _parse_message(r, owner, edits_by_key):
     try:
         data = json.loads(r["message_data"])
     except Exception:
         data = {}
 
-    content_type = data.get("mMessageContent", {}).get("mContentType", "UNKNOWN")
+    content = data.get("mMessageContent", {})
+    content_type = content.get("mContentType", "UNKNOWN")
     meta = data.get("mMetadata", {})
-    has_audio = data.get("mMessageContent", {}).get("mSnapDisplayInfo", {}).get("mHasAudio", False)
+    has_audio = content.get("mSnapDisplayInfo", {}).get("mHasAudio", False)
 
-    text = ""
+    original_text = ""
     snap_keys = []
-    if r["edit_text"]:
-        text = r["edit_text"]
-    elif content_type == "CHAT":
-        text = extract_chat_text(r["message_data"])
+    if content_type == "CHAT":
+        original_text = decode_chat_bytes(_arr_to_bytes(content.get("mContent", [])))
     elif content_type in ("SNAP", "EXTERNAL_MEDIA"):
         snap_keys = extract_snap_key(r["message_data"])
+
+    # Full revision history: the protobuf holds the original, chat_edits the versions.
+    edits = edits_by_key.get((r["conversation_id"], r["message_id"]), [])
+    text = edits[-1]["text"] if edits else original_text
 
     sender = r["username"]
     return {
         "id": r["id"],
+        "arroyo_id": data.get("mDescriptor", {}).get("mMessageId"),
+        "user_id": r["user_id"],
         "sender": sender,
         "is_me": sender == owner,
         "ts": fmt_ts(r["send_timestamp"]),
         "ts_raw": r["send_timestamp"],
         "type": content_type,
         "text": text,
+        "original_text": original_text,
+        "edits": edits,
+        "reply": _extract_quoted(content),
         "snap_keys": snap_keys,
         "has_audio": has_audio,
-        "edited": meta.get("mIsEdited", False),
+        "edited": bool(edits) or meta.get("mIsEdited", False),
         "deleted": meta.get("mTombstone", False),
         "seen": len(meta.get("mSeenBy", [])) > 0,
         "saved": len(meta.get("mSavedBy", [])) > 0,
@@ -453,20 +521,70 @@ def api_conversation(username):
     # Fetch ALL messages in those conversations (from every sender)
     placeholders = ",".join("?" * len(conv_ids))
     cur.execute(
-        f"""SELECT m.id, m.message_id, m.conversation_id, m.username,
-                  m.send_timestamp, m.group_title, m.message_data,
-                  ce.message_text as edit_text
+        f"""SELECT m.id, m.message_id, m.conversation_id, m.user_id, m.username,
+                  m.send_timestamp, m.group_title, m.message_data
            FROM messages m
-           LEFT JOIN chat_edits ce ON m.message_id = ce.message_id
-               AND m.conversation_id = ce.conversation_id
            WHERE m.conversation_id IN ({placeholders})
            ORDER BY m.send_timestamp ASC""",
         conv_ids,
     )
     rows = cur.fetchall()
+
+    # Every revision of every edited message in these conversations.
+    cur.execute(
+        f"""SELECT conversation_id, message_id, edit_number, added_timestamp, message_text
+           FROM chat_edits
+           WHERE conversation_id IN ({placeholders})
+           ORDER BY edit_number ASC""",
+        conv_ids,
+    )
+    edits_by_key = {}
+    for e in cur.fetchall():
+        txt = e["message_text"]
+        if isinstance(txt, (bytes, bytearray)):
+            txt = txt.decode("utf-8", errors="replace")
+        edits_by_key.setdefault((e["conversation_id"], e["message_id"]), []).append(
+            {"n": e["edit_number"], "ts": fmt_ts(e["added_timestamp"]), "text": txt}
+        )
     conn.close()
 
-    return jsonify([_parse_message(r, owner) for r in rows])
+    msgs = [_parse_message(r, owner, edits_by_key) for r in rows]
+
+    # Resolve replies: quoted messages reference the per-conversation arroyo id,
+    # so map that back to the row we're rendering and to a readable sender name.
+    # Arroyo ids are device-local and get reused after a reinstall, so a single
+    # (conversation, arroyo id) can hit several rows — pick the one whose send
+    # time is closest to the quote's own created-at.
+    by_arroyo = {}
+    names = {}
+    for m in msgs:
+        if m["arroyo_id"] is not None:
+            by_arroyo.setdefault((m["conv_id"], m["arroyo_id"]), []).append(m)
+        if m["user_id"] and m["sender"]:
+            names[m["user_id"]] = m["sender"]
+
+    for m in msgs:
+        rep = m["reply"]
+        if not rep or rep.get("unavailable"):
+            continue
+        rep["sender"] = names.get(rep.get("sender_uid"))
+        rep["is_me"] = rep["sender"] is not None and rep["sender"] == owner
+
+        candidates = by_arroyo.get((m["conv_id"], rep.get("arroyo_id")), [])
+        want = rep.get("ts_raw")
+        target = None
+        if len(candidates) == 1:
+            target = candidates[0]
+        elif candidates:
+            ref = want or m["ts_raw"] or 0
+            target = min(candidates, key=lambda c: abs((c["ts_raw"] or 0) - ref))
+        # A recycled id can point at an unrelated message when the real original
+        # was never logged; only link when the send time actually agrees.
+        if target and want and target["ts_raw"] and abs(target["ts_raw"] - want) > 2000:
+            target = None
+        rep["target_id"] = target["id"] if target else None
+
+    return jsonify(msgs)
 
 
 def _detect_media(data, fallback_ct="application/octet-stream"):
@@ -684,6 +802,32 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .b-shot{background:#2a0d1a;color:#f472b6}
   .b-audio{background:#1a1a0d;color:#a3e635}
   .conv-sep{text-align:center;font-size:0.65rem;color:#2a2a2a;padding:8px 0;border-top:1px solid #1a1a1a;margin-top:8px}
+
+  /* Reply quote */
+  .reply-quote{border-left:3px solid #a78bfa;background:rgba(167,139,250,.07);border-radius:5px;
+               padding:3px 7px;margin-bottom:4px;max-width:100%;overflow:hidden}
+  .reply-quote.clickable{cursor:pointer}
+  .reply-quote.clickable:hover{background:rgba(167,139,250,.16)}
+  .reply-quote.dead{border-left-color:#3a3a3a;background:rgba(255,255,255,.03)}
+  .reply-sender{font-size:0.62rem;color:#a78bfa;font-weight:600;margin-bottom:1px}
+  .reply-quote.dead .reply-sender{color:#555}
+  .reply-text{font-size:0.73rem;color:#8a8a8a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .reply-text.media{color:#666;font-style:italic}
+  .msg-row.flash .msg-bubble{animation:flashbg 1.4s ease-out}
+  @keyframes flashbg{0%,55%{background:#4c3a00;box-shadow:0 0 0 2px #fcd34d}100%{}}
+
+  /* Edit history */
+  .b-edited{cursor:default}
+  .b-edited.has-history{cursor:pointer}
+  .b-edited.has-history:hover{background:#3d340c;color:#fde68a}
+  .edit-history{margin-top:5px;border-top:1px solid rgba(251,191,36,.22);padding-top:4px;
+                display:flex;flex-direction:column;gap:3px}
+  .edit-ver{font-size:0.72rem;line-height:1.35}
+  .edit-label{font-size:0.58rem;color:#8a7320;text-transform:uppercase;letter-spacing:.4px;margin-right:5px}
+  .edit-ver.superseded .edit-body{color:#6f6f6f;text-decoration:line-through;text-decoration-color:#4a4a4a}
+  .edit-ver.current .edit-label{color:#fbbf24}
+  .edit-ver.current .edit-body{color:#d0d0d0}
+  .edit-ts{font-size:0.56rem;color:#4a4a4a;margin-left:5px}
   .spinner{width:36px;height:36px;border:3px solid #2a2a2a;border-top-color:#a78bfa;border-radius:50%;animation:spin .7s linear infinite}
   .loading-pane{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:#555;font-size:0.8rem}
   @keyframes spin{to{transform:rotate(360deg)}}
@@ -985,13 +1129,23 @@ async function loadMessages(username) {
       lastConvId = m.conv_id;
     }
 
+    const hasHistory = m.edits && m.edits.length > 0;
+    const editBadge = m.edited
+      ? (hasHistory
+          ? `<span class="badge b-edited has-history" onclick="toggleEdits(event,${m.id})" title="Show edit history">edited ▾</span>`
+          : '<span class="badge b-edited">edited</span>')
+      : '';
+
     const badges = [
       m.deleted   ? '<span class="badge b-deleted">deleted</span>' : '',
-      m.edited    ? '<span class="badge b-edited">edited</span>'   : '',
+      editBadge,
       m.saved     ? '<span class="badge b-saved">saved</span>'     : '',
       m.screenshot? '<span class="badge b-shot">screenshot</span>' : '',
       m.has_audio ? '<span class="badge b-audio">audio</span>'     : '',
     ].join('');
+
+    const replyHtml = replyQuoteHtml(m.reply);
+    const historyHtml = hasHistory ? editHistoryHtml(m) : '';
 
     let bodyHtml = '';
     if (m.text) {
@@ -1008,7 +1162,7 @@ async function loadMessages(username) {
     }
 
     if (isStatus) {
-      html += `<div class="msg-row status-row">
+      html += `<div class="msg-row status-row" id="m${m.id}">
         <div class="msg-bubble">
           <span class="type-pill pill-STATUS">${esc(label)}</span>
           ${badges}${bodyHtml}
@@ -1018,11 +1172,13 @@ async function loadMessages(username) {
     } else {
       const side = m.is_me ? 'me' : 'them';
       const senderLabel = m.is_me ? 'You' : esc(m.sender);
-      html += `<div class="msg-row ${side}">
+      html += `<div class="msg-row ${side}" id="m${m.id}">
         <div class="msg-sender">${senderLabel}</div>
         <div class="msg-bubble">
+          ${replyHtml}
           <span class="type-pill ${pillClass}">${label}</span>${badges}
           ${bodyHtml}
+          ${historyHtml}
         </div>
         <div class="msg-meta"><span class="msg-ts">${m.ts}</span></div>
       </div>`;
@@ -1033,6 +1189,73 @@ async function loadMessages(username) {
   pane.className = 'messages';
   pane.innerHTML = html;
   pane.scrollTop = pane.scrollHeight;
+}
+
+// ── Replies ──────────────────────────────────────────────────────────────────
+const QUOTE_PLACEHOLDERS = {
+  SNAP: '📷 Snap',
+  EXTERNAL_MEDIA: '🖼 Media',
+  NOTE: '🎤 Voice note',
+  STICKER: '😀 Sticker',
+  SHARE: '↗ Shared content',
+  STATUS: '• Status',
+};
+
+function replyQuoteHtml(rep) {
+  if (!rep) return '';
+  if (rep.unavailable) {
+    return `<div class="reply-quote dead">
+      <div class="reply-sender">↩ Reply</div>
+      <div class="reply-text media">original message unavailable</div>
+    </div>`;
+  }
+  const who = rep.is_me ? 'You' : (rep.sender ? esc(rep.sender) : 'Unknown');
+  const body = rep.text
+    ? `<div class="reply-text">${esc(rep.text)}</div>`
+    : `<div class="reply-text media">${QUOTE_PLACEHOLDERS[rep.type] || esc(rep.type || 'message')}</div>`;
+  const linked = rep.target_id != null;
+  return `<div class="reply-quote${linked ? ' clickable' : ' dead'}"
+       ${linked ? `onclick="jumpToMsg(event,${rep.target_id})" title="Jump to the replied-to message"` : ''}>
+    <div class="reply-sender">↩ ${who}${rep.ts ? `<span class="edit-ts">${esc(rep.ts)}</span>` : ''}</div>
+    ${body}
+  </div>`;
+}
+
+function jumpToMsg(ev, id) {
+  ev.stopPropagation();
+  const pane = document.getElementById('contentPane');
+  const target = document.getElementById('m' + id);
+  if (!pane || !target) return;
+  const offset = target.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+  pane.scrollTop += offset - (pane.clientHeight / 2);
+  target.classList.remove('flash');
+  void target.offsetWidth;   // restart the animation
+  target.classList.add('flash');
+}
+
+// ── Edit history ─────────────────────────────────────────────────────────────
+function editHistoryHtml(m) {
+  const versions = [{ label: 'original', text: m.original_text, ts: m.ts }];
+  m.edits.forEach(e => versions.push({ label: 'edit ' + e.n, text: e.text, ts: e.ts }));
+  const rows = versions.map((v, i) => {
+    const cls = i === versions.length - 1 ? 'current' : 'superseded';
+    return `<div class="edit-ver ${cls}">
+      <span class="edit-label">${esc(v.label)}</span>
+      <span class="edit-body">${v.text ? esc(v.text) : '—'}</span>
+      ${v.ts ? `<span class="edit-ts">${esc(v.ts)}</span>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="edit-history" id="eh${m.id}" style="display:none">${rows}</div>`;
+}
+
+function toggleEdits(ev, id) {
+  ev.stopPropagation();
+  const box = document.getElementById('eh' + id);
+  if (!box) return;
+  const open = box.style.display !== 'none';
+  box.style.display = open ? 'none' : 'flex';
+  const badge = ev.currentTarget;
+  if (badge) badge.textContent = open ? 'edited ▾' : 'edited ▴';
 }
 
 let _matchEls = [];
